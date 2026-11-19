@@ -1,4 +1,7 @@
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 import time
 import base64
 import logging
@@ -13,10 +16,11 @@ logging.basicConfig(
 log = logging.getLogger("day-trader-bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-5-5").strip()
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "").strip()
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 TWELVEDATA_URL = "https://api.twelvedata.com/time_series"
 BINANCE_URL = "https://api.binance.com/api/v3/klines"
 
@@ -26,55 +30,81 @@ TIMEFRAMES = {
 }
 
 
-def gemini_generate(prompt: str, image_bytes: Optional[bytes] = None, mime: str = "image/jpeg") -> str:
-    if not GEMINI_API_KEY:
-        return "Gemini is not configured. Add GEMINI_API_KEY to your .env file and restart the bot."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    parts = [{"text": prompt}]
+def claude_generate(
+    prompt: str,
+    image_bytes: Optional[bytes] = None,
+    mime: str = "image/jpeg",
+) -> str:
+    """Send text and optional chart image to the Anthropic Messages API."""
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("Claude is not configured. Add ANTHROPIC_API_KEY to .env.")
+
+    content = []
     if image_bytes:
-        parts.append({
-            "inline_data": {
-                "mime_type": mime,
+        if mime not in ("image/jpeg", "image/png", "image/gif", "image/webp"):
+            raise ValueError("Unsupported image type. Send a JPEG, PNG, GIF, or WebP chart.")
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mime,
                 "data": base64.b64encode(image_bytes).decode("ascii"),
-            }
+            },
         })
+    content.append({"type": "text", "text": prompt})
+
     payload = {
-        "contents": [{"role": "user", "parts": parts}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1100},
+        "model": CLAUDE_MODEL,
+        "max_tokens": 900,
+        "temperature": 0.2,
+        "messages": [{"role": "user", "content": content}],
     }
-    # Gemini can temporarily return 503 during capacity spikes. Retry only
-    # transient server/rate-limit errors; do not loop on invalid requests or keys.
-    data = None
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
     last_error = None
-    for attempt in range(5):
+    for attempt in range(4):
         try:
             with httpx.Client(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
-                response = client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
+                response = client.post(ANTHROPIC_URL, headers=headers, json=payload)
+
             if response.status_code in (408, 429, 500, 502, 503, 504):
-                last_error = f"Gemini temporarily unavailable (HTTP {response.status_code}): {response.text[:500]}"
-                if attempt < 4:
-                    delay = min(2 ** attempt * 2, 30)
-                    log.warning("%s; retrying in %s seconds", last_error, delay)
+                last_error = f"Claude temporarily unavailable (HTTP {response.status_code})."
+                if attempt < 3:
+                    delay = min(2 ** attempt * 2, 20)
+                    log.warning("%s Retrying in %s seconds.", last_error, delay)
                     time.sleep(delay)
                     continue
                 raise RuntimeError(last_error)
+
+            if response.status_code in (401, 403):
+                raise RuntimeError("Claude API key is invalid or does not have access. Check ANTHROPIC_API_KEY.")
+            if response.status_code == 400:
+                raise RuntimeError("Claude rejected the request. Check CLAUDE_MODEL and image format.")
             response.raise_for_status()
             data = response.json()
-            break
+            answer = "\n".join(
+                block.get("text", "")
+                for block in data.get("content", [])
+                if block.get("type") == "text"
+            ).strip()
+            if not answer:
+                raise RuntimeError("Claude returned an empty response. Please try again.")
+            return answer
+
         except httpx.TransportError as exc:
             last_error = str(exc)
-            if attempt < 4:
-                delay = min(2 ** attempt * 2, 30)
-                log.warning("Gemini network error: %s; retrying in %s seconds", exc, delay)
+            if attempt < 3:
+                delay = min(2 ** attempt * 2, 20)
+                log.warning("Claude network error: %s. Retrying in %s seconds.", exc, delay)
                 time.sleep(delay)
                 continue
-            raise RuntimeError(f"Gemini network request failed after retries: {last_error}") from exc
-    if data is None:
-        raise RuntimeError(last_error or "Gemini request failed after retries")
-    try:
-        return "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]).strip()
-    except (KeyError, IndexError, TypeError):
-        raise RuntimeError(f"Unexpected Gemini response: {data}")
+            raise RuntimeError("Could not connect to Claude after several attempts.") from exc
+
+    raise RuntimeError(last_error or "Claude request failed.")
 
 
 def get_market_data(symbol: str, timeframe: str) -> str:
@@ -82,13 +112,15 @@ def get_market_data(symbol: str, timeframe: str) -> str:
     if not tf:
         return "Unsupported timeframe. Use 1m, 5m, or 15m."
 
-    # Binance public spot candles: crypto pairs such as BTCUSDT, ETHUSDT.
     normalized = symbol.upper().replace("/", "").replace("-", "").replace("_", "")
-    if normalized.endswith("USDT") or normalized.endswith("BUSD") or normalized.endswith("BTC"):
-        interval = timeframe.lower().replace("m", "m")
+    if normalized.endswith(("USDT", "BUSD", "BTC")):
+        interval = timeframe.lower()
         try:
             with httpx.Client(timeout=20) as client:
-                r = client.get(BINANCE_URL, params={"symbol": normalized, "interval": interval, "limit": 30})
+                r = client.get(
+                    BINANCE_URL,
+                    params={"symbol": normalized, "interval": interval, "limit": 30},
+                )
                 r.raise_for_status()
                 rows = r.json()
             candles = [
@@ -96,7 +128,10 @@ def get_market_data(symbol: str, timeframe: str) -> str:
                  "low": float(x[3]), "close": float(x[4]), "volume": float(x[5])}
                 for x in rows
             ]
-            return f"Source: Binance Spot API. Symbol: {normalized}. Timeframe: {timeframe}. Recent OHLCV candles (oldest to newest): {candles}"
+            return (
+                f"Source: Binance Spot API. Symbol: {normalized}. "
+                f"Timeframe: {timeframe}. Recent OHLCV candles (oldest to newest): {candles}"
+            )
         except Exception as exc:
             log.warning("Binance data request failed: %s", exc)
 
@@ -117,14 +152,19 @@ def get_market_data(symbol: str, timeframe: str) -> str:
                     "low": float(x["low"]), "close": float(x["close"]),
                     "volume": x.get("volume"),
                 } for x in values]
-                return f"Source: Twelve Data API. Symbol: {symbol.upper()}. Timeframe: {timeframe}. Recent OHLCV candles (oldest to newest): {candles}"
+                return (
+                    f"Source: Twelve Data API. Symbol: {symbol.upper()}. "
+                    f"Timeframe: {timeframe}. Recent OHLCV candles (oldest to newest): {candles}"
+                )
             return f"Twelve Data did not return candles: {data.get('message', data.get('code', 'unknown response'))}"
         except Exception as exc:
             log.warning("Twelve Data request failed: %s", exc)
 
     if not TWELVEDATA_API_KEY:
-        return ("No live feed is configured for this symbol. Crypto USDT pairs use Binance automatically. "
-                "For forex, stocks, indices, and many commodities, add a Twelve Data API key as TWELVEDATA_API_KEY.")
+        return (
+            "No live feed is configured for this symbol. Crypto USDT pairs use Binance automatically. "
+            "For forex, stocks, indices, and many commodities, add a Twelve Data API key as TWELVEDATA_API_KEY."
+        )
     return "Live market data could not be retrieved. Check the symbol, API plan, and provider status."
 
 
@@ -134,7 +174,7 @@ Give conditional next-candle scenarios: (A) if the current candle closes bullish
 Cover trend/structure, momentum, nearby support/resistance, candle context, and uncertainty when evidence permits.
 Use WAIT/NO TRADE when evidence is weak or conflicting. Never promise a winning trade and never claim a calibrated probability.
 This bot is analysis/signals only. Never instruct automatic execution.
-Keep the reply SHORT, simple, and easy to understand. Use plain language. Maximum 6 short bullet points and about 100 words. Avoid long explanations, jargon, repeated warnings, and unnecessary indicator descriptions.
+Keep the reply SHORT, simple, and easy to understand. Use plain language. Maximum 6 short bullet points and about 100 words.
 Format:
 • Market/timeframe:
 • Current trend: Bullish / Bearish / Sideways
@@ -146,14 +186,14 @@ Do not give a trade entry, target, or stop unless the chart clearly supports it.
 
 
 def send_message(chat_id: int, text: str) -> None:
-    # Telegram message limit is 4096 characters.
     text = text or "No analysis was returned."
     with httpx.Client(timeout=25) as client:
         for start in range(0, len(text), 3900):
-            client.post(f"{TELEGRAM_API}/sendMessage", json={
+            response = client.post(f"{TELEGRAM_API}/sendMessage", json={
                 "chat_id": chat_id, "text": text[start:start + 3900],
                 "disable_web_page_preview": True,
-            }).raise_for_status()
+            })
+            response.raise_for_status()
 
 
 def handle_update(update: dict) -> None:
@@ -165,8 +205,8 @@ def handle_update(update: dict) -> None:
 
     if text.startswith("/start"):
         send_message(chat_id,
-            "📊 Day-Trader AI is running.\n\n"
-            "Send a chart screenshot for visual analysis. Include 1m, 5m, or 15m in the caption if possible.\n"
+            "📊 Day-Trader AI is running with Claude.\n\n"
+            "Send a chart screenshot for visual analysis. Include 1m, 5m, or 15m in the caption.\n"
             "Use /market BTCUSDT 5m for live crypto candles.\n"
             "Use /market EUR/USD 15m for supported non-crypto symbols (requires Twelve Data key).\n"
             "Commands: /help")
@@ -178,7 +218,7 @@ def handle_update(update: dict) -> None:
             "• /market BTCUSDT 1m\n"
             "• /market EUR/USD 5m (requires TWELVEDATA_API_KEY)\n"
             "Supported timeframes: 1m, 5m, 15m.\n"
-            "The bot provides scenarios, not guaranteed predictions or trade execution.")
+            "Claude gives short scenarios, not guaranteed predictions or trade execution.")
         return
 
     if text.startswith("/market"):
@@ -188,15 +228,20 @@ def handle_update(update: dict) -> None:
             return
         symbol, timeframe = bits[1], bits[2]
         market = get_market_data(symbol, timeframe)
-        if market.startswith("No live feed") or market.startswith("Live market data") or market.startswith("Unsupported"):
+        if market.startswith(("No live feed", "Live market data", "Unsupported")):
             send_message(chat_id, market)
             return
-        prompt = f"{ANALYSIS_RULES}\n\nAnalyze this verified provider data. The latest candle may still be open; do not treat it as closed unless provider data confirms closure.\n{market}"
+        prompt = (
+            f"{ANALYSIS_RULES}\n\n"
+            "Analyze this provider data. The latest candle may still be open; "
+            "do not treat it as closed unless provider data confirms closure.\n"
+            f"{market}"
+        )
         try:
-            send_message(chat_id, gemini_generate(prompt))
-        except Exception as exc:
+            send_message(chat_id, claude_generate(prompt))
+        except Exception:
             log.exception("Market analysis failed")
-            send_message(chat_id, f"Analysis failed: {exc}")
+            send_message(chat_id, "Analysis failed. Check the API key/model, then try again.")
         return
 
     photos = message.get("photo")
@@ -210,18 +255,23 @@ def handle_update(update: dict) -> None:
                 img = client.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}")
                 img.raise_for_status()
                 image_bytes = img.content
+            if len(image_bytes) > 5 * 1024 * 1024:
+                send_message(chat_id, "Image is too large. Please send a screenshot under 5 MB.")
+                return
+            ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else "jpg"
+            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                    "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
             caption = text or "No symbol/timeframe caption supplied."
             prompt = (
                 f"{ANALYSIS_RULES}\n\n"
                 f"User caption: {caption}\n"
                 "Inspect the chart screenshot. Identify visible timeframe/symbol only if legible. "
-                "Do not assume the current candle has closed. Explain both possible outcomes depending on its close."
+                "Do not assume the current candle has closed. Explain both outcomes depending on its close."
             )
-            mime = "image/png" if file_path.lower().endswith(".png") else "image/jpeg"
-            send_message(chat_id, gemini_generate(prompt, image_bytes, mime))
-        except Exception as exc:
+            send_message(chat_id, claude_generate(prompt, image_bytes, mime))
+        except Exception:
             log.exception("Screenshot analysis failed")
-            send_message(chat_id, f"Screenshot analysis failed: {exc}")
+            send_message(chat_id, "Screenshot analysis failed. Check the image and Claude API settings, then retry.")
         return
 
     if text:
@@ -231,10 +281,10 @@ def handle_update(update: dict) -> None:
 def main() -> None:
     if not TELEGRAM_TOKEN:
         raise SystemExit("Missing TELEGRAM_BOT_TOKEN. Copy .env.example to .env and add your bot token.")
-    if not GEMINI_API_KEY:
-        raise SystemExit("Missing GEMINI_API_KEY. Add it to .env before starting.")
+    if not ANTHROPIC_API_KEY:
+        raise SystemExit("Missing ANTHROPIC_API_KEY. Add your Claude API key to .env before starting.")
     offset = None
-    log.info("Telegram Day-Trader bot starting (analysis-only mode)")
+    log.info("Telegram Day-Trader bot starting with Claude (analysis-only mode)")
     while True:
         try:
             with httpx.Client(timeout=40) as client:
