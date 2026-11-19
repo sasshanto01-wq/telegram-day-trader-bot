@@ -30,7 +30,7 @@ In `.env`, add:
 - `CLAUDE_MODEL`: optional; defaults to `claude-sonnet-5-5`.
 - `TWELVEDATA_API_KEY`: optional; needed for live non-crypto symbols supported by your Twelve Data plan.
 
-Save nano with **Ctrl+O**, Enter, then **Ctrl+X**. Keep all keys private. Never commit `.env` or paste keys into chat.
+The bot automatically loads `.env` at startup using `python-dotenv`; do not export variables manually. Save nano with **Ctrl+O**, Enter, then **Ctrl+X**. Keep all keys private. Never commit `.env` or paste keys into chat.
 
 ## Start
 
@@ -60,7 +60,7 @@ python bot.py
 
 ## Troubleshooting
 
-- **Missing ANTHROPIC_API_KEY:** check that `.env` exists and contains your Anthropic API key.
+- **Missing ANTHROPIC_API_KEY:** confirm `.env` is in the same folder as `bot.py`, contains `ANTHROPIC_API_KEY=...`, and that `python-dotenv` installed successfully. The bot loads `.env` automatically.
 - **401/403:** the Anthropic key is invalid, disabled, or lacks API access.
 - **429/5xx:** API rate limit or temporary service issue; the bot retries temporary errors.
 - **No live feed:** Binance supports eligible crypto spot pairs; configure Twelve Data for supported non-crypto symbols.
