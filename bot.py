@@ -134,8 +134,15 @@ Give conditional next-candle scenarios: (A) if the current candle closes bullish
 Cover trend/structure, momentum, nearby support/resistance, candle context, and uncertainty when evidence permits.
 Use WAIT/NO TRADE when evidence is weak or conflicting. Never promise a winning trade and never claim a calibrated probability.
 This bot is analysis/signals only. Never instruct automatic execution.
-Format the answer with: Market & timeframe; What is visible; Bullish-close scenario; Bearish-close scenario; Bias (bullish/bearish/neutral); Key invalidation; Risk note.
-If the screenshot does not clearly show the symbol or timeframe, say so."""
+Keep the reply SHORT, simple, and easy to understand. Use plain language. Maximum 6 short bullet points and about 100 words. Avoid long explanations, jargon, repeated warnings, and unnecessary indicator descriptions.
+Format:
+• Market/timeframe:
+• Current trend: Bullish / Bearish / Sideways
+• If this candle closes GREEN: one short next-candle scenario.
+• If this candle closes RED: one short next-candle scenario.
+• Overall view: BUY BIAS / SELL BIAS / WAIT
+• Key level or reason: one short sentence.
+Do not give a trade entry, target, or stop unless the chart clearly supports it. If symbol or timeframe is unclear, say so briefly."""
 
 
 def send_message(chat_id: int, text: str) -> None:
