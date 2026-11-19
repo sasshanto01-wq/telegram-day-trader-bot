@@ -42,10 +42,35 @@ def gemini_generate(prompt: str, image_bytes: Optional[bytes] = None, mime: str 
         "contents": [{"role": "user", "parts": parts}],
         "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1100},
     }
-    with httpx.Client(timeout=75) as client:
-        response = client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
-        response.raise_for_status()
-        data = response.json()
+    # Gemini can temporarily return 503 during capacity spikes. Retry only
+    # transient server/rate-limit errors; do not loop on invalid requests or keys.
+    data = None
+    last_error = None
+    for attempt in range(5):
+        try:
+            with httpx.Client(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
+                response = client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
+            if response.status_code in (408, 429, 500, 502, 503, 504):
+                last_error = f"Gemini temporarily unavailable (HTTP {response.status_code}): {response.text[:500]}"
+                if attempt < 4:
+                    delay = min(2 ** attempt * 2, 30)
+                    log.warning("%s; retrying in %s seconds", last_error, delay)
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(last_error)
+            response.raise_for_status()
+            data = response.json()
+            break
+        except httpx.TransportError as exc:
+            last_error = str(exc)
+            if attempt < 4:
+                delay = min(2 ** attempt * 2, 30)
+                log.warning("Gemini network error: %s; retrying in %s seconds", exc, delay)
+                time.sleep(delay)
+                continue
+            raise RuntimeError(f"Gemini network request failed after retries: {last_error}") from exc
+    if data is None:
+        raise RuntimeError(last_error or "Gemini request failed after retries")
     try:
         return "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]).strip()
     except (KeyError, IndexError, TypeError):
